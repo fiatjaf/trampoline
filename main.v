@@ -14,6 +14,7 @@ fn main() {
 				handler: sendtrampoline
 			}
 		}
+		dynamic: true
 	}
 
 	plugin.initialize()
@@ -30,25 +31,25 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
          "id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
          "channel": "683194x1679x1",
          "msatoshi": 10015222,
-         "delay": 153,
+         "delay": 153
       },
       {
          "id": "02c16cca44562b590dd279c942200bdccfd4f990c3a69fad620c10ef2f8228eaff",
          "channel": "677702x1820x1",
          "msatoshi": 10015000,
-         "delay": 120,
-      }
-      {
-         "style": "trampoline"
-         "id": "02845cc3fb26c21575eba0fded926233f55b67b80180e01eead18aae848abc679f",
-         "msatoshi": 10009000,
-         "delay": 40,
+         "delay": 120
       },
       {
-         "style": "trampoline"
+         "style": "trampoline",
+         "id": "02845cc3fb26c21575eba0fded926233f55b67b80180e01eead18aae848abc679f",
+         "msatoshi": 10009000,
+         "delay": 80
+      },
+      {
+         "style": "trampoline",
          "id": "02868e12f320073cad0c2959c42559fbcfd1aa326fcb943492ed7f02c9820aa399",
          "msatoshi": 10000000,
-         "delay": 40,
+         "delay": 40
       }
     ]
     i.e., some hops in the beginning,
@@ -62,18 +63,18 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 	r_nodeinfo := p.client.call('getinfo') or {
 		return error('error getting own node info: $err.msg')
 	}
+
 	our_pubkey := r_nodeinfo.as_map()['id']
 	r_blockchaininfo := p.client.call('getchaininfo') or {
 		return error('error getting blockchain info: $err.msg')
 	}
 	current_block := r_blockchaininfo.as_map()['headercount'].int()
 
-	first_hop := route[0].as_map()['id']
+	mut first_hop := map[string]json2.Any{}
 	destination := route[route.len - 1].as_map()['id']
 
 	payment_hash := mparams['payment_hash']
 	label := mparams['label']
-	final_msatoshi := mparams['msatoshi']
 	bolt11 := mparams['bolt11']
 	partid := mparams['partid']
 	payment_secret := mparams['payment_secret'].str()
@@ -90,6 +91,11 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 		}
 	} else {
 		return error('missing payment_secret and no bolt11 invoice provided')
+	}
+
+	mut msatoshi := mparams['msatoshi']
+	if !(msatoshi is string) && !(msatoshi is int) {
+		msatoshi = route[route.len - 1].as_map()['msatoshi']
 	}
 
 	// extract the trampoline hops so we can turn them into a special onion later.
@@ -126,16 +132,16 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 	// actually make the TLV payloads
 	mut onionhops := []json2.Any{}
 	for i, _ in actual_route {
-		mut this_hop := route[i].as_map()
+		mut this_hop := actual_route[i].as_map()
 		mut onionhop := map{
-			'pubkey': this_hop['pubkey']
+			'pubkey': this_hop['id']
 		}
 
-		is_final := i < route.len - 1
+		is_final := i == actual_route.len - 1
 
 		mut payload := vlightning.Writer{}
 		next_hop := match is_final {
-			false { route[i + 1].as_map() }
+			false { actual_route[i + 1].as_map() }
 			true { this_hop }
 		}
 
@@ -154,14 +160,15 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 			// intermediate hop
 			payload.write_bigsize(vlightning.tlv_outgoing_channel_id) // T
 			payload.write_bigsize(8) // L
-			scid := next_hop['parse_short_channel_id'].str()
+			scid := next_hop['channel'].str()
+
 			scid_u64 := vlightning.parse_short_channel_id(scid) ?
 			payload.write_u64(scid_u64) // V
 		} else {
 			// final hop, will contain a fake secret and a trampoline onion
 			payload.write_bigsize(vlightning.tlv_payment_data) // T
 			mut fake_secret := [32]byte{} // deterministic
-			fake_secret_src := '${this_hop['pubkey']}$our_pubkey$payment_hash'
+			fake_secret_src := '${this_hop['id']}$our_pubkey$payment_hash'
 			bytes_to_32(mut fake_secret, sha256.sum256(fake_secret_src.bytes()))
 			msat_to_trampoline := vlightning.encode_tu64(u64(next_hop['msatoshi'].int()))
 			payload.write_bigsize(32 + msat_to_trampoline.len) // L
@@ -174,10 +181,10 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 				this_thop := trampolines[t].as_map()
 
 				mut trampoline_hop := map{
-					'pubkey': this_thop['pubkey']
+					'pubkey': this_thop['id']
 				}
 
-				is_tfinal := t < trampolines.len - 1
+				is_tfinal := t == trampolines.len - 1
 
 				mut tpayload := vlightning.Writer{}
 				next_thop := match is_tfinal {
@@ -200,7 +207,7 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 				if is_tfinal {
 					// final hop, include secret and invoice stuff
 					tpayload.write_bigsize(vlightning.tlv_payment_data) // T
-					final_msatoshi_tu64 := vlightning.encode_tu64(u64(final_msatoshi.int()))
+					final_msatoshi_tu64 := vlightning.encode_tu64(u64(msatoshi.int()))
 					tpayload.write_bigsize(32 + final_msatoshi_tu64.len) // L
 					tpayload.write_32(payment_secret_32)
 					tpayload.write_bytes(final_msatoshi_tu64)
@@ -234,8 +241,11 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 				trampoline_hops << trampoline_hop
 			}
 
-			r_tcreateonion := p.client.call('createonion', trampoline_hops, payment_hash,
-				400) or { return error('failed to create trampoline onion: $err.msg') }
+			r_tcreateonion := p.client.call('createonion', map{
+				'hops':       json2.Any(trampoline_hops)
+				'assocdata':  payment_hash
+				'onion_size': json2.Any(400)
+			}) or { return error('failed to create trampoline onion: $err.msg') }
 
 			trampoline_onion := hex_to_bytes(r_tcreateonion.as_map()['onion'].str())
 
@@ -252,9 +262,29 @@ fn sendtrampoline(p vlightning.Plugin, params json2.Any) ?json2.Any {
 		return error('failed to createonion: $err.msg')
 	}
 
+	first_hop['id'] = actual_route[0].as_map()['id']
+	first_hop['amount_msat'] = '${actual_route[0].as_map()['msatoshi']}msat'
+	first_hop['delay'] = actual_route[0].as_map()['delay']
 	onion := r_createonion.as_map()['onion']
 	shared_secrets := r_createonion.as_map()['shared_secrets']
 
-	return p.client.call('sendonion', onion, first_hop, payment_hash, label, shared_secrets,
-		partid, bolt11, final_msatoshi, destination)
+	mut sendonion_params := map{
+		'first_hop':      json2.Any(first_hop)
+		'onion':          onion
+		'shared_secrets': shared_secrets
+		'payment_hash':   payment_hash
+		'destination':    destination
+		'msatoshi':       msatoshi
+	}
+	if partid is int || partid is string {
+		sendonion_params['partid'] = partid
+	}
+	if label is string {
+		sendonion_params['label'] = label
+	}
+	if bolt11 is string {
+		sendonion_params['bolt11'] = bolt11
+	}
+
+	return p.client.call('sendonion', sendonion_params)
 }
